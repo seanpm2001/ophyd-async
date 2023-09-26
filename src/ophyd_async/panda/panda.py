@@ -82,6 +82,53 @@ class SeqTable(TypedDict):
     outf2: npt.NDArray[np.bool_]
 
 
+def build_seq_table(
+    repeats: Optional[npt.NDArray[np.uint16]] = None,
+    trigger: Optional[Sequence[SeqTrigger]] = None,
+    position: Optional[npt.NDArray[np.int32]] = None,
+    time1: Optional[npt.NDArray[np.uint32]] = None,
+    outa1: Optional[npt.NDArray[np.bool_]] = None,
+    outb1: Optional[npt.NDArray[np.bool_]] = None,
+    outc1: Optional[npt.NDArray[np.bool_]] = None,
+    outd1: Optional[npt.NDArray[np.bool_]] = None,
+    oute1: Optional[npt.NDArray[np.bool_]] = None,
+    outf1: Optional[npt.NDArray[np.bool_]] = None,
+    time2: Optional[npt.NDArray[np.uint32]] = None,
+    outa2: Optional[npt.NDArray[np.bool_]] = None,
+    outb2: Optional[npt.NDArray[np.bool_]] = None,
+    outc2: Optional[npt.NDArray[np.bool_]] = None,
+    outd2: Optional[npt.NDArray[np.bool_]] = None,
+    oute2: Optional[npt.NDArray[np.bool_]] = None,
+    outf2: Optional[npt.NDArray[np.bool_]] = None,
+) -> SeqTable:
+    assert time2 is not None, "time2 must be provided"
+    length = len(time2)
+    assert 0 < length < 4096, f"Length {length} not in range"
+    table = SeqTable(
+        repeats=repeats or np.ones(length),
+        trigger=trigger or [SeqTrigger.IMMEDIATE] * length,
+        position=position or np.zeros(length),
+        time1=time1 or np.zeros(length),
+        outa1=outa1 or np.zeros(length),
+        outb1=outb1 or np.zeros(length),
+        outc1=outc1 or np.zeros(length),
+        outd1=outd1 or np.zeros(length),
+        oute1=oute1 or np.zeros(length),
+        outf1=outf1 or np.zeros(length),
+        time2=time2,
+        outa2=outa2 or np.zeros(length),
+        outb2=outb2 or np.zeros(length),
+        outc2=outc2 or np.zeros(length),
+        outd2=outd2 or np.zeros(length),
+        oute2=oute2 or np.zeros(length),
+        outf2=outf2 or np.zeros(length),
+    )
+    for k, v in table.items():
+        if len(v) != length:
+            raise ValueError(f"{k}: has length {len(v)} not {length}")
+    return table
+
+
 class SeqBlock(Device):
     table: SignalRW[SeqTable]
 
