@@ -89,9 +89,9 @@ def linkam_plan(
             panda_streams=[PandAHDFLogic(panda, {"COUNTER1.VAL": "I0"})],
             fly_logic=PandATimeSeqLogic(panda),
         ),
-        outer_spec=Line(linkam, start_temp, stop_temp, num_temps),
-        outer_dets=[linkam],
-        inner_spec=Static.duration(exposure, num_frames),
+        sw_spec=Line(linkam, start_temp, stop_temp, num_temps),
+        sw_dets=[linkam],
+        hw_spec=Static.duration(exposure, num_frames),
     )
     return rs_uid
 
@@ -115,7 +115,7 @@ class FlyerLogic(ABC):
         ...
 
 
-def in_us(t: float):
+def in_micros(t: float):
     return int(t / 1e6)
 
 
@@ -130,7 +130,7 @@ class PandATimeSeqLogic(FlyerLogic):
         # TODO: consider what happens if the timebase changes
         await self.seq.prescale_units.set("us")
         table = build_seq_table(
-            time1=[in_us(exposure)], time2=[in_us(deadtime)], outa1=[1]
+            time1=[in_micros(exposure)], time2=[in_micros(deadtime)], outa1=[1]
         )
         await asyncio.gather(
             self.seq.prescale.set(1),
@@ -179,7 +179,7 @@ class ScanspecFlyer(
         self._watchers: List[Callable] = []
         self._fly_status: Optional[AsyncStatus] = None
         self._fly_start: float = 0.0
-        super().__init__(name="inner")
+        super().__init__(name="hw")
 
     @AsyncStatus.wrap
     async def stage(self) -> None:
@@ -202,7 +202,6 @@ class ScanspecFlyer(
         """Arm detectors and setup trajectories"""
         self._frames = frames
         self._num_frames = len(Path(self._frames))
-        # TODO: should this be EXPOSURE not DURATION?
         exposure = get_duration(self._frames)
         if exposure is None:
             det_coros = [
@@ -239,12 +238,12 @@ class ScanspecFlyer(
 
     async def describe_collect(self) -> Dict[str, Descriptor]:
         shapes = asyncio.gather(*[det.detector_logic.get_shape() for det in self.dets])
-        # TODO: add outer_shape here when detectors are multiplied up
+        # TODO: add sw_shape here when detectors are multiplied up
         coros = [
-            det.stream_logic.describe_datasets(det.name, shape, outer_shape=())
+            det.stream_logic.describe_datasets(det.name, shape, sw_shape=())
             for det, shape in zip(self.dets, shapes)
         ] + [
-            stream.describe_datasets("", (), outer_shape=())
+            stream.describe_datasets("", (), sw_shape=())
             for stream in self.panda_streams
         ]
         return await merge_gathered_dicts(coros)
@@ -286,37 +285,38 @@ class ScanspecFlyer(
 
 def scanspec_fly(
     flyer: ScanspecFlyer,
-    inner_spec: Spec[Device],
-    outer_spec: Spec[Device] = Repeat(1),
-    outer_dets: Sequence[Device] = (),
+    hw_spec: Spec[Device],
+    sw_spec: Spec[Device] = Repeat(1),
+    sw_dets: Sequence[Device] = (),
     flush_period=0.5,
     md: Optional[Dict[str, Any]] = None,
 ):
+    # TODO: hw and sw instead of hw and sw
     _md = {
-        "inner_spec": inner_spec.serialize(),
-        "inner_dets": [det.name for det in flyer.dets],
-        "outer_spec": outer_spec.serialize(),
-        "outer_dets": [det.name for det in outer_dets],
+        "hw_spec": hw_spec.serialize(),
+        "hw_dets": [det.name for det in flyer.dets],
+        "sw_spec": sw_spec.serialize(),
+        "sw_dets": [det.name for det in sw_dets],
         "hints": {},
     }
     _md.update(md or {})
 
-    @bpp.stage_decorator([flyer] + list(outer_dets))
+    @bpp.stage_decorator([flyer] + list(sw_dets))
     @bpp.run_decorator(md=_md)
-    def inner_scanspec_fly():
-        yield from bps.declare_stream(*outer_dets, name="outer")
-        yield from bps.declare_stream(flyer, name="inner")
-        inner_frames = inner_spec.calculate()
-        for point in outer_spec.midpoints():
+    def hw_scanspec_fly():
+        yield from bps.declare_stream(*sw_dets, name="sw")
+        yield from bps.declare_stream(flyer, name="hw")
+        hw_frames = hw_spec.calculate()
+        for point in sw_spec.midpoints():
             # Move flyer to start too
-            point[flyer] = inner_frames
+            point[flyer] = hw_frames
             # TODO: need to make pos_cache optional in this func
             yield from bps.move_per_step(point)
-            yield from bps.trigger_and_read(outer_dets)
+            yield from bps.trigger_and_read(sw_dets)
             yield from bps.checkpoint()
             yield from bps.kickoff(flyer)
             complete_group = group_uuid("complete")
-            yield from bps.complete(group=complete_group)
+            yield from bps.complete(flyer, group=complete_group)
             done = False
             while not done:
                 try:
@@ -328,5 +328,5 @@ def scanspec_fly(
                 yield from bps.collect(flyer, stream=True, return_payload=False)
                 yield from bps.checkpoint()
 
-    rs_uid = yield from inner_scanspec_fly()
+    rs_uid = yield from hw_scanspec_fly()
     return rs_uid
