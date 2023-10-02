@@ -42,22 +42,14 @@ class DetectorTrigger(Enum):
 
 class DetectorLogic(ABC):
     @abstractmethod
-    async def get_shape(self) -> Sequence[int]:
-        """Get the shape of the detector, slowest moving dim first"""
-
-    @abstractmethod
-    async def get_deadtime(self, exposure: float) -> float:
-        """For a given exposure, how long should the time between frames be
-
-        This may set PVs and will only be used when disarmed
-        """
+    def get_deadtime(self, exposure: float) -> float:
+        """For a given exposure, how long should the time between exposures be"""
 
     @abstractmethod
     async def arm(
         self,
         trigger: DetectorTrigger = DetectorTrigger.internal,
         num: int = 0,
-        exposure: Optional[float] = None,
     ) -> AsyncStatus:
         """Arm the detector and return AsyncStatus that waits for num frames to be written"""
 
@@ -66,30 +58,32 @@ class DetectorLogic(ABC):
         """Disarm the detector"""
 
 
-class StreamLogic(ABC):
+class WriterLogic(ABC):
     @abstractmethod
-    async def open(self):
-        """Open stream and wait for it to be ready for frames"""
+    async def open(self, multiplier: int = 1) -> Dict[str, Descriptor]:
+        """Open writer and wait for it to be ready for data.
+
+        Args:
+            multiplier: Each StreamDatum index corresponds to this many
+                written exposures
+
+        Returns:
+            Output for ``describe()``
+        """
 
     @abstractmethod
-    async def describe_datasets(
-        self, name: str, detector_shape: Sequence[int], outer_shape: Sequence[int] = ()
-    ) -> Dict[str, Descriptor]:
-        """Describe the datasets this will create"""
-
-    @abstractmethod
-    async def frames_written(self) -> int:
-        """Get the number of frames written"""
+    async def get_indices_written(self, at_least: Optional[int] = None) -> int:
+        """Get the number of indices written, at_least is the min value it will be"""
 
     @abstractmethod
     async def collect_stream_docs(
-        self, frames_written: int
+        self, indices_written: int
     ) -> AsyncIterator[Union[StreamResource, StreamDatum]]:
         """Create Stream docs up to given number written"""
 
     @abstractmethod
     async def close(self):
-        """Close stream and wait for it to be finished"""
+        """Close writer and wait for it to be finished"""
 
 
 @dataclass
@@ -99,41 +93,57 @@ class DirectoryInfo:
 
 
 class DirectoryProvider(Protocol):
-    @abstractproperty
-    def directory_info(self) -> DirectoryInfo:
+    @abstractmethod
+    def __call__(self) -> DirectoryInfo:
         """Get the current directory to write files into"""
 
 
 class StaticDirectoryProvider(DirectoryProvider):
     def __init__(self, directory_path: str, filename_prefix: str) -> None:
-        self.directory_info = DirectoryInfo(directory_path, filename_prefix)
+        self._directory_info = DirectoryInfo(directory_path, filename_prefix)
+
+    def __call__(self) -> DirectoryInfo:
+        return self._directory_info
 
 
-class StreamDetector(
+class NameProvider(Protocol):
+    @abstractmethod
+    def __call__(self) -> str:
+        ...
+
+
+class ShapeProvider(Protocol):
+    @abstractmethod
+    async def __call__(self) -> Sequence[int]:
+        ...
+
+
+class StreamingDetector(
     Device, Stageable, Configurable, Readable, Triggerable, WritesExternalAssets
 ):
     def __init__(
         self,
         detector_logic: DetectorLogic,
-        stream_logic: StreamLogic,
+        writer_logic: WriterLogic,
         settings: Dict[str, Any],
         config_sigs: Sequence[SignalR],
         name: str = "",
         **plugins: Device,
     ) -> None:
         self.detector_logic = detector_logic
-        self.stream_logic = stream_logic
+        self.writer_logic = writer_logic
         self._settings = settings
         self._config_sigs = config_sigs
+        self._describe: Dict[str, Descriptor] = {}
         self.__dict__.update(plugins)
         super().__init__(name)
 
     @AsyncStatus.wrap
     async def stage(self) -> None:
         # Stop everything, get into a known state and open the stream"""
-        await asyncio.gather(self.stream_logic.close(), self.detector_logic.disarm())
+        await asyncio.gather(self.writer_logic.close(), self.detector_logic.disarm())
         await load_settings(self, self._settings)
-        await self.stream_logic.open()
+        self._describe = await self.writer_logic.open()
 
     async def describe_configuration(self) -> Dict[str, Descriptor]:
         return await merge_gathered_dicts(sig.describe() for sig in self._config_sigs)
@@ -141,10 +151,8 @@ class StreamDetector(
     async def read_configuration(self) -> Dict[str, Reading]:
         return await merge_gathered_dicts(sig.read() for sig in self._config_sigs)
 
-    async def describe(self) -> Dict[str, Descriptor]:
-        # Describe the datasets that will be written
-        detector_shape = await self.detector_logic.get_shape()
-        return await self.stream_logic.describe_datasets(self.name, detector_shape)
+    def describe(self) -> Dict[str, Descriptor]:
+        return self._describe
 
     @AsyncStatus.wrap
     async def trigger(self) -> None:
@@ -157,10 +165,10 @@ class StreamDetector(
         return {}
 
     async def collect_asset_docs(self) -> Iterator[Asset]:
-        frames_written = await self.stream_logic.frames_written()
-        async for doc in self.stream_logic.collect_stream_docs(frames_written):
+        indices_written = await self.writer_logic.indices_written()
+        async for doc in self.writer_logic.collect_stream_docs(indices_written):
             yield doc
 
     @AsyncStatus.wrap
     async def unstage(self) -> None:
-        await self.stream_logic.close()
+        await self.writer_logic.close()

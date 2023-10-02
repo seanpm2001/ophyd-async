@@ -38,13 +38,6 @@ class PilatusLogic(DetectorLogic):
     def __init__(self, driver: ADPilatus) -> None:
         self._driver = driver
 
-    async def get_shape(self) -> Sequence[int]:
-        shape = await asyncio.gather(
-            self._driver.array_size_y.get_value(),
-            self._driver.array_size_x.get_value(),
-        )
-        return shape
-
     async def get_deadtime(self, exposure: float) -> float:
         return 0.002
 

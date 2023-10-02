@@ -2,16 +2,29 @@ import asyncio
 import time
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+)
 
 import bluesky.plan_stubs as bps
 import bluesky.preprocessors as bpp
 import numpy as np
+from bluesky import Msg
 from bluesky.protocols import (
+    Asset,
     Collectable,
     Descriptor,
     Flyable,
     Movable,
+    PartialEvent,
     Reading,
     Stageable,
     SyncOrAsync,
@@ -21,16 +34,22 @@ from scanspec.core import Frames, Path
 from scanspec.specs import DURATION, Line, Repeat, Spec, Static
 
 from ophyd_async.core import Device, DeviceCollector, StandardReadable
-from ophyd_async.core._device._signal.signal import wait_for_value
+from ophyd_async.core._device._signal.signal import SignalR, wait_for_value
 from ophyd_async.core.async_status import AsyncStatus
 from ophyd_async.core.utils import merge_gathered_dicts
 from ophyd_async.detector import (
     DetectorTrigger,
     StaticDirectoryProvider,
-    StreamDetector,
-    StreamLogic,
+    StreamingDetector,
+    WriterLogic,
 )
-from ophyd_async.epics.areadetector import NDFileHDF, NDPluginStats, hdf_logic, pilatus
+from ophyd_async.epics.areadetector import (
+    NDFileHDF,
+    NDPluginStats,
+    ad_driver,
+    hdf_logic,
+    pilatus,
+)
 from ophyd_async.epics.signal import epics_signal_r, epics_signal_rw
 from ophyd_async.panda.panda import PandA, PcapBlock, SeqBlock, build_seq_table
 
@@ -40,10 +59,16 @@ dp = StaticDirectoryProvider("/dls/p45/data/cmxxx/i22-yyy", "i22-yyy-")
 def hdf_stats_pilatus(prefix: str, settings_path: str):
     drv = pilatus.ADPilatus(prefix + "DRV:")
     hdf = NDFileHDF(prefix + "HDF:")
-    det = StreamDetector(
+    det = StreamingDetector(
         detector_logic=pilatus.PilatusLogic(drv),
-        stream_logic=hdf_logic.HDFLogic(hdf, dp, sum="NDStatsSum"),
-        # settings=settings_from_yaml(settings_path),
+        writer_logic=hdf_logic.ADHDFLogic(
+            hdf,
+            directory_provider=dp,
+            name_provider=lambda: det.name,
+            shape_provider=ad_driver.ADDriverShapeProvider(drv),
+            sum="NDStatsSum",
+        ),
+        settings=settings_from_yaml(settings_path),
         config_sigs=[drv.acquire_time, drv.acquire_period],
         drv=drv,
         stats=NDPluginStats(prefix + "STATS:"),
@@ -75,13 +100,53 @@ with DeviceCollector():
     linkam = Linkam("BL22I-EA-TEMPC-01:")
 
 
-def linkam_plan(
-    start_temp: float,
-    stop_temp: float,
-    num_temps: int,
+def linkam_fly_plan(
+    target_temp: float,
+    ramp_rate: float,
     num_frames: int,
     exposure: float,
+    period: float,
+    md: Optional[Dict[str, Any]] = None,
 ):
+    """Fly the linkam, taking timed frames perodically.
+
+    Ramp to target_temp at ramp_rate, then every period while not at target,
+    expose num_frames.
+    """
+    _md = {
+        "hw_spec": hw_spec.serialize(),
+        "hw_dets": [det.name for det in flyer.dets],
+        "sw_spec": sw_spec.serialize(),
+        "sw_dets": [det.name for det in sw_dets],
+        "hints": {},
+    }
+    _md.update(md or {})
+
+    @bpp.stage_decorator([flyer] + list(sw_dets))
+    @bpp.run_decorator(md=_md)
+    def inner_linkam_fly_plan():
+        yield from bps.abs_set(linkam.ramp_rate, ramp_rate)
+        linkam_group = group_uuid("linkam")
+        yield from bps.abs_set(linkam, target_temp, group=linkam_group, wait=False)
+        done = False
+        while not done:
+            yield from take_timed_frames(exposure, num_frames)
+            try:
+                yield from bps.wait(group=linkam_group, timeout=period)
+            except TimeoutError:
+                pass
+            else:
+                done = True
+
+
+def fast_freeze_plan(
+    start_temp: float,
+    freeze_temp: float,
+):
+    pass
+
+
+def generic_thing():
     rs_uid = yield from scanspec_fly(
         flyer=ScanspecFlyer(
             dets=[saxs, waxs],
@@ -101,49 +166,67 @@ def group_uuid(name: str) -> str:
     return f"{name}-{str(uuid.uuid4())[:6]}"
 
 
+class DetectorGroupLogic(ABC):
+    # Read multipliers here, exposure is set in the plan
+    @abstractmethod
+    async def open(self) -> Dict[str, Descriptor]:
+        """Open all writers, wait for them to be open and return their descriptors"""
+
+    @abstractmethod
+    async def ensure_armed(self) -> AsyncStatus:
+        """Ensure the detectors are armed, return AsyncStatus that waits for disarm."""
+
+    @abstractmethod
+    async def collect_asset_docs(self) -> AsyncIterator[Asset]:
+        """Collect asset docs from all writers"""
+
+    @abstractmethod
+    async def wait_for_index(self, index: int):
+        """Wait until a specific index is ready to be collected"""
+
+    @abstractmethod
+    async def disarm(self):
+        """Disarm detectors"""
+
+    @abstractmethod
+    async def close(self):
+        """Close all writers and wait for them to be closed"""
+
+
 class FlyerLogic(ABC):
     @abstractmethod
-    async def setup(self, path: Path, exposure: Optional[float], deadtime: float):
-        ...
+    async def prepare(self, path: Path):
+        """Move to the start of the flyscan"""
 
     @abstractmethod
     async def fly(self):
-        ...
+        """Start the flyscan"""
 
     @abstractmethod
     async def stop(self):
-        ...
+        """Stop flying and wait everything to be stopped"""
 
 
 def in_micros(t: float):
-    return int(t / 1e6)
+    return np.ceil(t / 1e6)
 
 
-class PandATimeSeqLogic(FlyerLogic):
-    def __init__(self, pcap: PcapBlock, seq: SeqBlock) -> None:
-        self.pcap = pcap
+class PandARepeatedSeqLogic(FlyerLogic):
+    def __init__(self, srgate: SrgateBlock, seq: SeqBlock) -> None:
+        self.srgate = srgate
         self.seq = seq
 
-    async def setup(self, path: Path, exposure: Optional[float], deadtime: float):
-        await self.stop()
-        assert exposure, "Can only do a fixed exposure at the moment"
-        # TODO: consider what happens if the timebase changes
-        await self.seq.prescale_units.set("us")
-        table = build_seq_table(
-            time1=[in_micros(exposure)], time2=[in_micros(deadtime)], outa1=[1]
-        )
-        await asyncio.gather(
-            self.seq.prescale.set(1),
-            self.seq.repeats.set(len(path)),
-            self.seq.table.set(table),
-        )
+    async def prepare(self, path: Path):
+        # Only use path for length
+        assert path.axes() == [], "Not expecting to move anything"
+        await self.seq.repeats.set(len(path))
 
     async def fly(self):
-        await self.pcap.arm.set(1)
+        await self.srgate.force_set.execute()
 
     async def stop(self):
-        await self.pcap.arm.set(0, wait=True)
-        await wait_for_value(self.pcap.arm, 0, timeout=1)
+        await self.srgate.force_rst.execute()
+        await wait_for_value(self.srgate.out, 0, timeout=1)
 
 
 def get_duration(frames: List[Frames]) -> Optional[float]:
@@ -164,134 +247,141 @@ class ScanspecFlyer(
 ):
     def __init__(
         self,
-        dets: Sequence[StreamDetector],
-        panda_streams: Sequence[StreamLogic],
+        detector_group_logic: DetectorGroupLogic,
+        flyer_logic: FlyerLogic,
         settings: Dict[Device, Dict[str, Any]],
-        fly_logic: FlyerLogic,
+        configuration_signals: Sequence[SignalR],
     ):
-        self.dets = list(dets)
-        self.panda_streams = list(panda_streams)
-        self.fly_logic = fly_logic
-        self.settings = settings
+        self._detector_group_logic = detector_group_logic
+        self._last_index = 0
+        self._offset = 0
+        self._flyer_logic = flyer_logic
+        self._settings = settings
+        self._configuration_signals = tuple(configuration_signals)
+        self._spec: Optional[Spec] = None
         self._frames: List[Frames] = []
-        self._det_statuses: List[AsyncStatus] = []
-        self._num_frames: int = 0
+        self._describe: Dict[str, Descriptor] = {}
+        self._det_status: Optional[AsyncStatus] = None
         self._watchers: List[Callable] = []
         self._fly_status: Optional[AsyncStatus] = None
-        self._fly_start: float = 0.0
+        self._fly_start = 0.0
+        self._current_frame = 0
         super().__init__(name="hw")
 
     @AsyncStatus.wrap
     async def stage(self) -> None:
-        # Stop everything, get into a known state and open the stream"""
-        stage_statuses = [det.stage() for det in self.dets]
-        await asyncio.gather(
-            *[self.fly_logic.stop()] + [stream.close() for stream in self.panda_streams]
-        )
+        await self.unstage()
         await asyncio.gather(
             *[
                 load_settings(device, settings)
-                for device, settings in self.settings.items()
+                for device, settings in self._settings.items()
             ]
         )
-        await asyncio.gather(*[stream.open() for stream in self.panda_streams])
-        await asyncio.gather(*stage_statuses)
+        await self._detector_group_logic.open()
 
     @AsyncStatus.wrap
-    async def set(self, frames: List[Frames]):
+    async def set(self, spec: Spec):
         """Arm detectors and setup trajectories"""
-        self._frames = frames
-        self._num_frames = len(Path(self._frames))
-        exposure = get_duration(self._frames)
-        if exposure is None:
-            det_coros = [
-                det.detector_logic.arm(
-                    trigger=DetectorTrigger.variable_gate,
-                    num=self._num_frames,
-                )
-                for det in self.dets
-            ]
-        else:
-            det_coros = [
-                det.detector_logic.arm(
-                    trigger=DetectorTrigger.constant_gate,
-                    num=self._num_frames,
-                    exposure=exposure,
-                )
-                for det in self.dets
-            ]
-        # Start arming the detectors
-        det_future = asyncio.gather(*det_coros)
-        deadtime = max(det.detector_logic.get_deadtime(exposure) for det in self.dets)
-        # Move to start and setup the flyscan
-        await self.fly_logic.setup(Path(self._frames), exposure, deadtime)
-        # Wait for detectors to be armed
-        self._det_statuses = await det_future
+        if spec != self._spec:
+            self._spec = spec
+            self._frames = spec.calculate()
+        # Move to start and setup the flyscan, and arm dets in parallel
+        self._current_frame = 0
+        self._det_status, _ = await asyncio.gather(
+            self._detector_group_logic.ensure_armed(),
+            self._flyer_logic.prepare(Path(self._frames)),
+        )
+        await self._reset_offsets()
+
+    async def _reset_offsets(self):
+        # Reset detector group offsets so next frame index will be associated
+        # with self._current_frame
+        async for name, doc in self._detector_group_logic.collect_asset_docs():
+            if name == "stream_datum":
+                self._last_index = doc["indices"]["stop"]
+        # Make sure the next index it makes will act as progress for current frame
+        self._offset = self._last_index - self._current_frame
 
     async def describe_configuration(self) -> Dict[str, Descriptor]:
         return await merge_gathered_dicts(
-            det.describe_configuration() for det in self.dets
+            [sig.describe() for sig in self._configuration_signals]
         )
 
     async def read_configuration(self) -> Dict[str, Reading]:
-        return await merge_gathered_dicts(det.read_configuration() for det in self.dets)
+        return await merge_gathered_dicts(
+            [sig.read() for sig in self._configuration_signals]
+        )
 
     async def describe_collect(self) -> Dict[str, Descriptor]:
-        shapes = asyncio.gather(*[det.detector_logic.get_shape() for det in self.dets])
-        # TODO: add sw_shape here when detectors are multiplied up
-        coros = [
-            det.stream_logic.describe_datasets(det.name, shape, sw_shape=())
-            for det, shape in zip(self.dets, shapes)
-        ] + [
-            stream.describe_datasets("", (), sw_shape=())
-            for stream in self.panda_streams
-        ]
-        return await merge_gathered_dicts(coros)
+        return self._describe
 
     @AsyncStatus.wrap
     async def kickoff(self) -> None:
         self._watchers = []
-        self._fly_status = AsyncStatus(self.fly_logic.fly(), self._watchers)
+        self._fly_status = AsyncStatus(self._fly(), self._watchers)
         self._fly_start = time.monotonic()
 
+    async def _fly(self) -> None:
+        await self._flyer_logic.fly()
+        # Wait for all detectors to have written up to a particular frame
+        await self._detector_group_logic.wait_for_index(
+            self._current_frame + self._offset
+        )
+
     async def collect_asset_docs(self) -> AsyncIterator[Asset]:
-        stream_logics = [det.stream_logic for det in self.dets] + self.panda_streams
-        frames_written = min(await stream.frames_written() for stream in stream_logics)
-        for stream in stream_logics:
-            async for doc in stream.collect_stream_docs(frames_written):
-                yield doc
-        for watcher in self._watchers:
-            watcher(
-                name=self.name,
-                current=frames_written,
-                initial=0,
-                target=self._num_frames,
-                units="",
-                precision=0,
-                time_elapsed=time.monotonic() - self._fly_start,
-            )
+        async for name, doc in self._detector_group_logic.collect_asset_docs():
+            if name == "stream_datum":
+                self._last_index = doc["indices"]["stop"]
+            yield name, doc
+        current_frame = self._last_index - self._offset
+        if current_frame != self._current_frame:
+            self._current_frame = current_frame
+            for watcher in self._watchers:
+                watcher(
+                    name=self.name,
+                    current=current_frame,
+                    initial=0,
+                    target=len(self._spec),
+                    unit="",
+                    precision=0,
+                    time_elapsed=time.monotonic() - self._fly_start,
+                )
 
     def complete(self) -> AsyncStatus:
         assert self._fly_status, "Kickoff not run"
         return self._fly_status
 
+    async def pause(self):
+        assert self._fly_status, "Kickoff not run"
+        self._fly_status.task.cancel()
+        await self._flyer_logic.stop()
+        await self._flyer_logic.prepare(Path(self._frames, start=self._current_frame))
+
+    async def resume(self):
+        assert self._fly_status, "Kickoff not run"
+        assert self._fly_status.task.cancelled(), "You didn't call pause"
+        await self._reset_offsets()
+        self._fly_status.task = asyncio.create_task(self._fly())
+
     @AsyncStatus.wrap
     async def unstage(self) -> None:
-        coros = [det.stage() for det in self.dets] + [
-            stream.close() for stream in self.panda_streams
-        ]
-        await asyncio.gather(*coros)
+        await asyncio.gather(
+            self._flyer_logic.stop(),
+            self._detector_group_logic.close(),
+            self._detector_group_logic.disarm(),
+        )
+        self._last_index = self._offset = 0
 
 
 def scanspec_fly(
     flyer: ScanspecFlyer,
     hw_spec: Spec[Device],
+    setup_detectors: Iterator[Msg] = iter([]),
     sw_spec: Spec[Device] = Repeat(1),
     sw_dets: Sequence[Device] = (),
     flush_period=0.5,
     md: Optional[Dict[str, Any]] = None,
 ):
-    # TODO: hw and sw instead of hw and sw
     _md = {
         "hw_spec": hw_spec.serialize(),
         "hw_dets": [det.name for det in flyer.dets],
@@ -304,12 +394,12 @@ def scanspec_fly(
     @bpp.stage_decorator([flyer] + list(sw_dets))
     @bpp.run_decorator(md=_md)
     def hw_scanspec_fly():
+        yield from setup_detectors()
         yield from bps.declare_stream(*sw_dets, name="sw")
         yield from bps.declare_stream(flyer, name="hw")
-        hw_frames = hw_spec.calculate()
         for point in sw_spec.midpoints():
             # Move flyer to start too
-            point[flyer] = hw_frames
+            point[flyer] = hw_spec
             # TODO: need to make pos_cache optional in this func
             yield from bps.move_per_step(point)
             yield from bps.trigger_and_read(sw_dets)

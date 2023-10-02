@@ -6,9 +6,17 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Sequence, Unio
 from bluesky.protocols import Descriptor
 from event_model import StreamDatum, StreamResource, compose_stream_resource
 
-from ophyd_async.core._device._signal.signal import set_and_wait_for_value
+from ophyd_async.core._device._signal.signal import (
+    set_and_wait_for_value,
+    wait_for_value,
+)
 from ophyd_async.core.async_status import AsyncStatus
-from ophyd_async.detector import DirectoryProvider, StreamLogic
+from ophyd_async.detector import (
+    DirectoryProvider,
+    NameProvider,
+    ShapeProvider,
+    WriterLogic,
+)
 
 from .nd_file_hdf import FileWriteMode, NDFileHDF
 
@@ -42,35 +50,40 @@ class _HDFFile:
         for bundle in self._bundles:
             yield bundle.stream_resource_doc
 
-    def stream_data(self, frames_written: int) -> Iterator[StreamDatum]:
-        if frames_written >= self._last_emitted:
-            indices = dict(start=self._last_emitted, stop=frames_written)
-            self._last_emitted = frames_written
+    def stream_data(self, indices_written: int) -> Iterator[StreamDatum]:
+        if indices_written >= self._last_emitted:
+            indices = dict(start=self._last_emitted, stop=indices_written)
+            self._last_emitted = indices_written
             self._last_flush = time.monotonic()
             for bundle in self._bundles:
                 yield bundle.compose_stream_datum(indices)
         if time.monotonic() - self._last_flush > FRAME_TIMEOUT:
-            raise TimeoutError(f"Writing stalled on frame {frames_written}")
+            raise TimeoutError(f"Writing stalled on frame {indices_written}")
         return None
 
 
-class ADHDFLogic(StreamLogic):
+class ADHDFLogic(WriterLogic):
     def __init__(
         self,
         plugin: NDFileHDF,
         directory_provider: DirectoryProvider,
+        name_provider: NameProvider,
+        shape_provider: ShapeProvider,
         **scalar_datasets_paths: str,
     ) -> None:
         self._plugin = plugin
         self._directory_provider = directory_provider
+        self._name_provider = name_provider
+        self._shape_provider = shape_provider
         self._scalar_datasets_paths = scalar_datasets_paths
         self._capture_status: Optional[AsyncStatus] = None
         self._datasets: List[_HDFDataset] = []
         self._file: Optional[_HDFFile] = None
+        self._multiplier = 1
 
-    async def open(self):
+    async def open(self, multiplier: int = 1) -> Dict[str, Descriptor]:
         self._file = None
-        info = self._directory_provider.directory_info
+        info = self._directory_provider()
         await asyncio.gather(
             self._plugin.lazy_open.set(True),
             self._plugin.swmr_mode.set(True),
@@ -83,10 +96,13 @@ class ADHDFLogic(StreamLogic):
         )
         # Wait for it to start, stashing the status that tells us when it finishes
         self._capture_status = await set_and_wait_for_value(self._plugin.capture, True)
-
-    async def describe_datasets(
-        self, name: str, detector_shape: Sequence[int], outer_shape: Sequence[int] = ()
-    ) -> Dict[str, Descriptor]:
+        name = self._name_provider()
+        detector_shape = tuple(await self._shape_provider())
+        self._multiplier = multiplier
+        if multiplier > 1:
+            outer_shape = (multiplier,)
+        else:
+            outer_shape = ()
         # Add the main data
         self._datasets = [
             _HDFDataset(name, "/entry/data", outer_shape + detector_shape)
@@ -94,7 +110,7 @@ class ADHDFLogic(StreamLogic):
         # And all the scalar datasets
         for ds_name, ds_path in self._scalar_datasets_paths.items():
             self._datasets.append(
-                _HDFDataset(f"{name}.{ds_name}", f"/entry/{ds_path}", outer_shape)
+                _HDFDataset(f"{name}.{ds_name}", f"/entry/{ds_path}", outer_shape + ())
             )
         describe = {
             ds.name: Descriptor(
@@ -107,19 +123,28 @@ class ADHDFLogic(StreamLogic):
         }
         return describe
 
-    async def frames_written(self) -> int:
-        return await self._plugin.num_captured.get_value()
+    async def get_indices_written(self, at_least: Optional[int] = None) -> int:
+        sig = self._plugin.num_captured
+        if at_least is not None:
+
+            def matcher(value: int) -> bool:
+                return value // self._multiplier >= at_least
+
+            matcher.__name__ = f"at_least_{at_least}"
+            await wait_for_value(sig, matcher, timeout=None)
+        return (await self._plugin.num_captured.get_value()) // self._multiplier
 
     async def collect_stream_docs(
-        self, frames_written: int
+        self, indices_written: int
     ) -> AsyncIterator[Union[StreamResource, StreamDatum]]:
-        if frames_written and not self._file:
+        # TODO: fail if we get dropped frames
+        if indices_written and not self._file:
             self._file = _HDFFile(
                 await self._plugin.full_file_name.get_value(), self._datasets
             )
             for doc in self._file.stream_resources():
                 yield doc
-        for doc in self._file.stream_data(frames_written):
+        for doc in self._file.stream_data(indices_written):
             yield doc
 
     async def close(self):

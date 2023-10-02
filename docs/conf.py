@@ -59,8 +59,8 @@ extensions = [
     "numpydoc",
 ]
 
-napoleon_google_docstring = False
-napoleon_numpy_docstring = True
+napoleon_google_docstring = True
+napoleon_numpy_docstring = False
 
 # If true, Sphinx will warn about all references where the target cannot
 # be found.
