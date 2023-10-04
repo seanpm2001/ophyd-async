@@ -28,7 +28,8 @@ FRAME_TIMEOUT = 120
 class _HDFDataset:
     name: str
     path: str
-    frame_shape: Sequence[int]
+    shape: Sequence[int]
+    multiplier: int
 
 
 class _HDFFile:
@@ -41,7 +42,10 @@ class _HDFFile:
                 root="/",
                 data_key=ds.name,
                 resource_path=full_file_name,
-                resource_kwargs={"path": ds.path, "frame_shape": ds.frame_shape},
+                resource_kwargs={
+                    "path": ds.path,
+                    "multiplier": ds.multiplier,
+                },
             )
             for ds in datasets
         ]
@@ -51,8 +55,12 @@ class _HDFFile:
             yield bundle.stream_resource_doc
 
     def stream_data(self, indices_written: int) -> Iterator[StreamDatum]:
+        # Indices are relative to resource
         if indices_written >= self._last_emitted:
-            indices = dict(start=self._last_emitted, stop=indices_written)
+            indices = dict(
+                start=self._last_emitted,
+                stop=indices_written,
+            )
             self._last_emitted = indices_written
             self._last_flush = time.monotonic()
             for bundle in self._bundles:
@@ -104,18 +112,16 @@ class ADHDFLogic(WriterLogic):
         else:
             outer_shape = ()
         # Add the main data
-        self._datasets = [
-            _HDFDataset(name, "/entry/data", outer_shape + detector_shape)
-        ]
+        self._datasets = [_HDFDataset(name, "/entry/data", detector_shape, multiplier)]
         # And all the scalar datasets
         for ds_name, ds_path in self._scalar_datasets_paths.items():
             self._datasets.append(
-                _HDFDataset(f"{name}.{ds_name}", f"/entry/{ds_path}", outer_shape + ())
+                _HDFDataset(f"{name}.{ds_name}", f"/entry/{ds_path}", (), multiplier)
             )
         describe = {
             ds.name: Descriptor(
                 source=self._plugin.full_file_name.source,
-                shape=ds.frame_shape,
+                shape=outer_shape + ds.shape,
                 dtype="array",
                 external="STREAM:",
             )
@@ -123,16 +129,16 @@ class ADHDFLogic(WriterLogic):
         }
         return describe
 
-    async def get_indices_written(self, at_least: Optional[int] = None) -> int:
-        sig = self._plugin.num_captured
-        if at_least is not None:
+    async def wait_for_index(self, index: int):
+        def matcher(value: int) -> bool:
+            return value // self._multiplier >= index
 
-            def matcher(value: int) -> bool:
-                return value // self._multiplier >= at_least
+        matcher.__name__ = f"index_at_least_{index}"
+        await wait_for_value(self._plugin.num_captured, matcher, timeout=None)
 
-            matcher.__name__ = f"at_least_{at_least}"
-            await wait_for_value(sig, matcher, timeout=None)
-        return (await self._plugin.num_captured.get_value()) // self._multiplier
+    async def get_indices_written(self) -> int:
+        num_captured = await self._plugin.num_captured.get_value()
+        return num_captured // self._multiplier
 
     async def collect_stream_docs(
         self, indices_written: int

@@ -8,15 +8,19 @@ from typing import (
     AsyncIterator,
     Callable,
     Dict,
+    Generic,
     Iterator,
     List,
+    Literal,
     Optional,
     Sequence,
+    Union,
 )
 
 import bluesky.plan_stubs as bps
 import bluesky.preprocessors as bpp
 import numpy as np
+from annotated_types import T
 from bluesky import Msg
 from bluesky.protocols import (
     Asset,
@@ -33,11 +37,12 @@ from bluesky.protocols import (
 from scanspec.core import Frames, Path
 from scanspec.specs import DURATION, Line, Repeat, Spec, Static
 
-from ophyd_async.core import Device, DeviceCollector, StandardReadable
+from ophyd_async.core import Device, DeviceCollector, StandardReadable, T
 from ophyd_async.core._device._signal.signal import SignalR, wait_for_value
 from ophyd_async.core.async_status import AsyncStatus
-from ophyd_async.core.utils import merge_gathered_dicts
+from ophyd_async.core.utils import gather_list, merge_gathered_dicts
 from ophyd_async.detector import (
+    DetectorLogic,
     DetectorTrigger,
     StaticDirectoryProvider,
     StreamingDetector,
@@ -193,9 +198,53 @@ class DetectorGroupLogic(ABC):
         """Close all writers and wait for them to be closed"""
 
 
-class FlyerLogic(ABC):
+class TriggeredDetectorsLogic(DetectorGroupLogic):
+    def __init__(
+        self,
+        detector_logics: Sequence[DetectorLogic],
+        writer_logics: Sequence[WriterLogic],
+    ) -> None:
+        self.detector_logics = detector_logics
+        self.writer_logics = writer_logics
+        self._arm_status: Optional[AsyncStatus] = None
+
+    async def open(self) -> Dict[str, Descriptor]:
+        return merge_gathered_dicts(wl.open() for wl in self.writer_logics)
+
+    async def ensure_armed(self) -> AsyncStatus:
+        if not self._arm_status or self._arm_status.done:
+            # We need to re-arm
+            # TODO: how to do variable gate here?
+            statuses = await gather_list(
+                dl.arm(DetectorTrigger.constant_gate) for dl in self.detector_logics
+            )
+            self._arm_status = AsyncStatus(gather_list(statuses))
+        return self._arm_status
+
+    async def collect_asset_docs(self) -> AsyncIterator[Asset]:
+        indices_written = min(
+            gather_list(wl.get_indices_written() for wl in self.writer_logics)
+        )
+        for wl in self.writer_logics:
+            async for doc in wl.collect_stream_docs(indices_written):
+                yield doc
+
     @abstractmethod
-    async def prepare(self, path: Path):
+    async def wait_for_index(self, index: int):
+        await gather_list(wl.wait_for_index(index) for wl in self.writer_logics)
+
+    @abstractmethod
+    async def disarm(self):
+        await gather_list(dl.disarm() for dl in self.detector_logics)
+
+    @abstractmethod
+    async def close(self):
+        await gather_list(wl.close() for wl in self.writer_logics)
+
+
+class FlyerLogic(ABC, Generic[T]):
+    @abstractmethod
+    async def prepare(self, value: T):
         """Move to the start of the flyscan"""
 
     @abstractmethod
@@ -242,19 +291,20 @@ def get_duration(frames: List[Frames]) -> Optional[float]:
     raise ValueError("Duration not specified in Spec")
 
 
+ScanAxis = Union[Device, Literal["DURATION"]]
+
+
 class ScanspecFlyer(
     Device, Movable, Stageable, Flyable, Collectable, WritesExternalAssets
 ):
     def __init__(
         self,
         detector_group_logic: DetectorGroupLogic,
-        flyer_logic: FlyerLogic,
+        flyer_logic: FlyerLogic[Path[ScanAxis]],
         settings: Dict[Device, Dict[str, Any]],
         configuration_signals: Sequence[SignalR],
     ):
         self._detector_group_logic = detector_group_logic
-        self._last_index = 0
-        self._offset = 0
         self._flyer_logic = flyer_logic
         self._settings = settings
         self._configuration_signals = tuple(configuration_signals)
@@ -265,7 +315,8 @@ class ScanspecFlyer(
         self._watchers: List[Callable] = []
         self._fly_status: Optional[AsyncStatus] = None
         self._fly_start = 0.0
-        self._current_frame = 0
+        self._offset = 0  # Add this to index to get frame number
+        self._current_frame = 0  # The current frame we are on
         super().__init__(name="hw")
 
     @AsyncStatus.wrap
@@ -278,29 +329,27 @@ class ScanspecFlyer(
             ]
         )
         await self._detector_group_logic.open()
+        self._offset = 0
+        self._current_frame = 0
 
     @AsyncStatus.wrap
-    async def set(self, spec: Spec):
+    async def set(self, spec: Spec[ScanAxis]):
         """Arm detectors and setup trajectories"""
         if spec != self._spec:
             self._spec = spec
             self._frames = spec.calculate()
-        # Move to start and setup the flyscan, and arm dets in parallel
+        # index + offset = current_frame, but starting a new scan so want it to be 0
+        # so subtract current_frame from both sides
+        self._offset -= self._current_frame
         self._current_frame = 0
+        await self._prepare(Path(self._frames))
+
+    async def _prepare(self, path: Path[ScanAxis]):
+        # Move to start and setup the flyscan, and arm dets in parallel
         self._det_status, _ = await asyncio.gather(
             self._detector_group_logic.ensure_armed(),
-            self._flyer_logic.prepare(Path(self._frames)),
+            self._flyer_logic.prepare(path),
         )
-        await self._reset_offsets()
-
-    async def _reset_offsets(self):
-        # Reset detector group offsets so next frame index will be associated
-        # with self._current_frame
-        async for name, doc in self._detector_group_logic.collect_asset_docs():
-            if name == "stream_datum":
-                self._last_index = doc["indices"]["stop"]
-        # Make sure the next index it makes will act as progress for current frame
-        self._offset = self._last_index - self._current_frame
 
     async def describe_configuration(self) -> Dict[str, Descriptor]:
         return await merge_gathered_dicts(
@@ -324,16 +373,14 @@ class ScanspecFlyer(
     async def _fly(self) -> None:
         await self._flyer_logic.fly()
         # Wait for all detectors to have written up to a particular frame
-        await self._detector_group_logic.wait_for_index(
-            self._current_frame + self._offset
-        )
+        await self._detector_group_logic.wait_for_index(len(self._spec) - self._offset)
 
     async def collect_asset_docs(self) -> AsyncIterator[Asset]:
+        current_frame = self._current_frame
         async for name, doc in self._detector_group_logic.collect_asset_docs():
             if name == "stream_datum":
-                self._last_index = doc["indices"]["stop"]
+                current_frame = doc["indices"]["stop"] + self._offset
             yield name, doc
-        current_frame = self._last_index - self._offset
         if current_frame != self._current_frame:
             self._current_frame = current_frame
             for watcher in self._watchers:
@@ -354,13 +401,15 @@ class ScanspecFlyer(
     async def pause(self):
         assert self._fly_status, "Kickoff not run"
         self._fly_status.task.cancel()
-        await self._flyer_logic.stop()
-        await self._flyer_logic.prepare(Path(self._frames, start=self._current_frame))
+        await self.unstage()
+        await self._detector_group_logic.open()
+        # Next frame will have index 0, but will be self._current_frame
+        self._offset = self._current_frame
+        await self._prepare(Path(self._frames, start=self._current_frame))
 
     async def resume(self):
         assert self._fly_status, "Kickoff not run"
         assert self._fly_status.task.cancelled(), "You didn't call pause"
-        await self._reset_offsets()
         self._fly_status.task = asyncio.create_task(self._fly())
 
     @AsyncStatus.wrap
@@ -370,7 +419,6 @@ class ScanspecFlyer(
             self._detector_group_logic.close(),
             self._detector_group_logic.disarm(),
         )
-        self._last_index = self._offset = 0
 
 
 def scanspec_fly(

@@ -130,3 +130,7 @@ class StaticDirectoryProvider(DirectoryProvider):
 
     def __call__(self) -> DirectoryInfo:
         return self._directory_info
+
+
+def gather_list(coros: Iterable[Awaitable[T]]) -> Awaitable[List[T]]:
+    return asyncio.gather(*coros)

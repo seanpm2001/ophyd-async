@@ -72,8 +72,12 @@ class WriterLogic(ABC):
         """
 
     @abstractmethod
-    async def get_indices_written(self, at_least: Optional[int] = None) -> int:
-        """Get the number of indices written, at_least is the min value it will be"""
+    async def wait_for_index(self, index: int):
+        """Wait until a specific index is ready to be collected"""
+
+    @abstractmethod
+    async def get_indices_written(self) -> int:
+        """Get the number of indices written"""
 
     @abstractmethod
     async def collect_stream_docs(
@@ -165,10 +169,16 @@ class StreamingDetector(
         return {}
 
     async def collect_asset_docs(self) -> Iterator[Asset]:
-        indices_written = await self.writer_logic.indices_written()
+        indices_written = await self.writer_logic.get_indices_written()
         async for doc in self.writer_logic.collect_stream_docs(indices_written):
             yield doc
 
     @AsyncStatus.wrap
     async def unstage(self) -> None:
         await self.writer_logic.close()
+
+    async def pause(self) -> None:
+        await self.detector_logic.disarm()
+
+    async def resume(self) -> None:
+        await self.writer_logic.reset_index()
