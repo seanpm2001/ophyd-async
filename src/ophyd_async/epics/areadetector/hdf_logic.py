@@ -6,17 +6,12 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Sequence, Unio
 from bluesky.protocols import Descriptor
 from event_model import StreamDatum, StreamResource, compose_stream_resource
 
+from ophyd_async.core import DirectoryProvider, NameProvider, ShapeProvider, WriterLogic
 from ophyd_async.core._device._signal.signal import (
     set_and_wait_for_value,
     wait_for_value,
 )
 from ophyd_async.core.async_status import AsyncStatus
-from ophyd_async.detector import (
-    DirectoryProvider,
-    NameProvider,
-    ShapeProvider,
-    WriterLogic,
-)
 
 from .nd_file_hdf import FileWriteMode, NDFileHDF
 
@@ -45,6 +40,7 @@ class _HDFFile:
                 resource_kwargs={
                     "path": ds.path,
                     "multiplier": ds.multiplier,
+                    "timestamps": "/entry/instrument/NDAttributes/NDArrayTimeStamp",
                 },
             )
             for ds in datasets

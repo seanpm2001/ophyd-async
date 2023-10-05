@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import re
+from dataclasses import dataclass
 from enum import Enum
 from typing import (
     Callable,
@@ -82,7 +83,50 @@ class SeqTable(TypedDict):
     outf2: npt.NDArray[np.bool_]
 
 
-def build_seq_table(
+@dataclass
+class SeqTableRow:
+    repeats: int = 1
+    trigger: SeqTrigger = SeqTrigger.IMMEDIATE
+    position: int = 0
+    time1: int = 0
+    outa1: bool = False
+    outb1: bool = False
+    outc1: bool = False
+    outd1: bool = False
+    oute1: bool = False
+    outf1: bool = False
+    time2: int = 0
+    outa2: bool = False
+    outb2: bool = False
+    outc2: bool = False
+    outd2: bool = False
+    oute2: bool = False
+    outf2: bool = False
+
+
+def seq_table_from_rows(*rows: SeqTableRow):
+    return seq_table_from_arrays(
+        repeats=np.ndarray([row.repeats for row in rows], dtype=np.uint16),
+        trigger=[row.trigger for row in rows],
+        position=np.ndarray([row.position for row in rows], dtype=np.int32),
+        time1=np.ndarray([row.time1 for row in rows], dtype=np.uint32),
+        outa1=np.ndarray([row.outa1 for row in rows], dtype=np.bool_),
+        outb1=np.ndarray([row.outb1 for row in rows], dtype=np.bool_),
+        outc1=np.ndarray([row.outc1 for row in rows], dtype=np.bool_),
+        outd1=np.ndarray([row.outd1 for row in rows], dtype=np.bool_),
+        oute1=np.ndarray([row.oute1 for row in rows], dtype=np.bool_),
+        outf1=np.ndarray([row.outf1 for row in rows], dtype=np.bool_),
+        time2=np.ndarray([row.time2 for row in rows], dtype=np.uint32),
+        outa2=np.ndarray([row.outa2 for row in rows], dtype=np.bool_),
+        outb2=np.ndarray([row.outb2 for row in rows], dtype=np.bool_),
+        outc2=np.ndarray([row.outc2 for row in rows], dtype=np.bool_),
+        outd2=np.ndarray([row.outd2 for row in rows], dtype=np.bool_),
+        oute2=np.ndarray([row.oute2 for row in rows], dtype=np.bool_),
+        outf2=np.ndarray([row.outf2 for row in rows], dtype=np.bool_),
+    )
+
+
+def seq_table_from_arrays(
     repeats: Optional[npt.NDArray[np.uint16]] = None,
     trigger: Optional[Sequence[SeqTrigger]] = None,
     position: Optional[npt.NDArray[np.int32]] = None,
