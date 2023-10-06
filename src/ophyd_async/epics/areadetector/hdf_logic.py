@@ -140,6 +140,7 @@ class ADHDFLogic(WriterLogic):
         self, indices_written: int
     ) -> AsyncIterator[Union[StreamResource, StreamDatum]]:
         # TODO: fail if we get dropped frames
+        await self._plugin.flush_now.execute()
         if indices_written and not self._file:
             self._file = _HDFFile(
                 await self._plugin.full_file_name.get_value(), self._datasets
