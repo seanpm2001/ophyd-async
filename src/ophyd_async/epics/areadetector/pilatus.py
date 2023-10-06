@@ -50,5 +50,7 @@ class PilatusLogic(DetectorLogic):
         return await set_and_wait_for_value(self._driver.acquire, True)
 
     async def disarm(self):
-        await self._driver.acquire.set(1, wait=False)
+        # wait=False means don't caput callback. We can't use caput callback as we
+        # already used it in arm() and we can't have 2 or they will deadlock
+        await self._driver.acquire.set(0, wait=False)
         await wait_for_value(self._driver.acquire, False, timeout=1)
