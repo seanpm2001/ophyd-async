@@ -190,6 +190,23 @@ def group_uuid(name: str) -> str:
     return f"{name}-{str(uuid.uuid4())[:6]}"
 
 
+def fly_and_collect(flyer, flush_period=0.5, checkpoint_every_collect=False):
+    yield from bps.kickoff(flyer)
+    complete_group = group_uuid("complete")
+    yield from bps.complete(flyer, group=complete_group)
+    done = False
+    while not done:
+        try:
+            yield from bps.wait(group=complete_group, timeout=flush_period)
+        except TimeoutError:
+            pass
+        else:
+            done = True
+        yield from bps.collect(flyer, stream=True, return_payload=False)
+        if checkpoint_every_collect:
+            yield from bps.checkpoint()
+
+
 class DetectorGroupLogic(ABC):
     # Read multipliers here, exposure is set in the plan
     @abstractmethod
@@ -454,11 +471,7 @@ class ScanSpecFlyable(StandardFlyable[Path[ScanAxis]], Pausable):
         if value != self._spec:
             self._spec = value
             self._frames = value.calculate()
-        # index + offset = current_frame, but starting a new scan so want it to be 0
-        # so subtract current_frame from both sides
-        self._offset -= self._current_frame
-        self._current_frame = 0
-        await self._prepare(Path(self._frames))
+        super().set(Path(self._frames))
 
     async def pause(self):
         assert self._fly_status, "Kickoff not run"
@@ -488,137 +501,8 @@ def get_duration(frames: List[Frames]) -> Optional[float]:
     raise ValueError("Duration not specified in Spec")
 
 
-class ScanspecFlyer(
-    Device, Movable, Stageable, Flyable, Collectable, WritesExternalAssets
-):
-    def __init__(
-        self,
-        detector_group_logic: DetectorGroupLogic,
-        trigger_logic: TriggerLogic[Path[ScanAxis]],
-        settings: Dict[Device, Dict[str, Any]],
-        configuration_signals: Sequence[SignalR],
-    ):
-        self._detector_group_logic = detector_group_logic
-        self._trigger_logic = trigger_logic
-        self._settings = settings
-        self._configuration_signals = tuple(configuration_signals)
-        self._spec: Optional[Spec] = None
-        self._frames: List[Frames] = []
-        self._describe: Dict[str, Descriptor] = {}
-        self._det_status: Optional[AsyncStatus] = None
-        self._watchers: List[Callable] = []
-        self._fly_status: Optional[AsyncStatus] = None
-        self._fly_start = 0.0
-        self._offset = 0  # Add this to index to get frame number
-        self._current_frame = 0  # The current frame we are on
-        self._last_frame = 0  # The last frame that will be emitted
-        super().__init__(name="hw")
-
-    @AsyncStatus.wrap
-    async def stage(self) -> None:
-        await self.unstage()
-        await asyncio.gather(
-            *[
-                load_settings(device, settings)
-                for device, settings in self._settings.items()
-            ]
-        )
-        await self._detector_group_logic.open()
-        self._offset = 0
-        self._current_frame = 0
-
-    @AsyncStatus.wrap
-    async def set(self, spec: Spec[ScanAxis]):
-        """Arm detectors and setup trajectories"""
-        if spec != self._spec:
-            self._spec = spec
-            self._frames = spec.calculate()
-        # index + offset = current_frame, but starting a new scan so want it to be 0
-        # so subtract current_frame from both sides
-        self._offset -= self._current_frame
-        self._current_frame = 0
-        await self._prepare(Path(self._frames))
-
-    async def _prepare(self, path: Path[ScanAxis]):
-        # Move to start and setup the flyscan, and arm dets in parallel
-        self._det_status, num_frames = await asyncio.gather(
-            self._detector_group_logic.ensure_armed(),
-            self._trigger_logic.prepare(path),
-        )
-        self._last_frame = self._current_frame + num_frames
-
-    async def describe_configuration(self) -> Dict[str, Descriptor]:
-        return await merge_gathered_dicts(
-            [sig.describe() for sig in self._configuration_signals]
-        )
-
-    async def read_configuration(self) -> Dict[str, Reading]:
-        return await merge_gathered_dicts(
-            [sig.read() for sig in self._configuration_signals]
-        )
-
-    async def describe_collect(self) -> Dict[str, Descriptor]:
-        return self._describe
-
-    @AsyncStatus.wrap
-    async def kickoff(self) -> None:
-        self._watchers = []
-        self._fly_status = AsyncStatus(self._fly(), self._watchers)
-        self._fly_start = time.monotonic()
-
-    async def _fly(self) -> None:
-        await self._trigger_logic.start()
-        # Wait for all detectors to have written up to a particular frame
-        await self._detector_group_logic.wait_for_index(self._last_frame + self._offset)
-
-    async def collect_asset_docs(self) -> AsyncIterator[Asset]:
-        current_frame = self._current_frame
-        async for name, doc in self._detector_group_logic.collect_asset_docs():
-            if name == "stream_datum":
-                current_frame = doc["indices"]["stop"] + self._offset
-            yield name, doc
-        if current_frame != self._current_frame:
-            self._current_frame = current_frame
-            for watcher in self._watchers:
-                watcher(
-                    name=self.name,
-                    current=current_frame,
-                    initial=0,
-                    target=len(self._spec),
-                    unit="",
-                    precision=0,
-                    time_elapsed=time.monotonic() - self._fly_start,
-                )
-
-    def complete(self) -> AsyncStatus:
-        assert self._fly_status, "Kickoff not run"
-        return self._fly_status
-
-    async def pause(self):
-        assert self._fly_status, "Kickoff not run"
-        self._fly_status.task.cancel()
-        await self.unstage()
-        await self._detector_group_logic.open()
-        # Next frame will have index 0, but will be self._current_frame
-        self._offset = self._current_frame
-        await self._prepare(Path(self._frames, start=self._current_frame))
-
-    async def resume(self):
-        assert self._fly_status, "Kickoff not run"
-        assert self._fly_status.task.cancelled(), "You didn't call pause"
-        self._fly_status.task = asyncio.create_task(self._fly())
-
-    @AsyncStatus.wrap
-    async def unstage(self) -> None:
-        await asyncio.gather(
-            self._trigger_logic.stop(),
-            self._detector_group_logic.close(),
-            self._detector_group_logic.disarm(),
-        )
-
-
 def scanspec_fly(
-    flyer: ScanspecFlyer,
+    flyer: ScanSpecFlyable,
     hw_spec: Spec[Device],
     setup_detectors: Iterator[Msg] = iter([]),
     sw_spec: Spec[Device] = Repeat(1),
@@ -638,7 +522,7 @@ def scanspec_fly(
     @bpp.stage_decorator([flyer] + list(sw_dets))
     @bpp.run_decorator(md=_md)
     def hw_scanspec_fly():
-        yield from setup_detectors()
+        yield from setup_detectors
         yield from bps.declare_stream(*sw_dets, name="sw")
         yield from bps.declare_stream(flyer, name="hw")
         for point in sw_spec.midpoints():
@@ -648,19 +532,9 @@ def scanspec_fly(
             yield from bps.move_per_step(point)
             yield from bps.trigger_and_read(sw_dets)
             yield from bps.checkpoint()
-            yield from bps.kickoff(flyer)
-            complete_group = group_uuid("complete")
-            yield from bps.complete(flyer, group=complete_group)
-            done = False
-            while not done:
-                try:
-                    yield from bps.wait(group=complete_group, timeout=flush_period)
-                except TimeoutError:
-                    pass
-                else:
-                    done = True
-                yield from bps.collect(flyer, stream=True, return_payload=False)
-                yield from bps.checkpoint()
+            yield from fly_and_collect(
+                flyer, flush_period, checkpoint_every_collect=True
+            )
 
     rs_uid = yield from hw_scanspec_fly()
     return rs_uid
