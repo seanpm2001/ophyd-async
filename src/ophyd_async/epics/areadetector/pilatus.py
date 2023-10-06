@@ -7,7 +7,7 @@ from ophyd_async.core._device._signal.signal import (
     wait_for_value,
 )
 from ophyd_async.core.async_status import AsyncStatus
-from ophyd_async.detector import ArmMode, DetectorLogic
+from ophyd_async.detector import DetectorTrigger, DetectorLogic
 from ophyd_async.epics.areadetector.utils import ImageMode, ad_rw
 
 from .ad_driver import ADDriver
@@ -28,9 +28,9 @@ class ADPilatus(ADDriver):
 
 
 TRIGGER_MODE = {
-    ArmMode.internal: TriggerMode.internal,
-    ArmMode.gated: TriggerMode.ext_enable,
-    ArmMode.triggered: TriggerMode.ext_trigger,
+    DetectorTrigger.internal: TriggerMode.internal,
+    DetectorTrigger.constant_gate: TriggerMode.ext_enable,
+    DetectorTrigger.variable_gate: TriggerMode.ext_enable,
 }
 
 
