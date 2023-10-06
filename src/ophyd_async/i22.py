@@ -129,23 +129,31 @@ def linkam_plan(
                     \__       /
                        \     /
             cool_temp   \__ /
-        exposures   xx   xx   xx    num_frames=2 each time
+        exposures    xx  xx   xx    num_frames=2 each time
         cool_collections=2  heat_collections=1
 
     Fast shutter will be opened for each group of exposures
     """
-    dets = [saxs, waxs]
+    dets = [saxs, waxs, tetramm]
     flyer = StandardFlyable(
         TriggeredDetectorsLogic(
             [det.detector_logic for det in dets],
             [det.writer_logic for det in dets],
         ),
         PandARepeatedTriggerLogic(panda.seq[1], shutter_time=0.004),
+        settings={saxs: config_with_temperature_stamping},
+        # Or maybe a different object?
     )
     deadtime = max(det.detector_logic.get_deadtime(exposure) for det in dets)
-    # TODO: add in crystal frequency correction
-    repeated_trigger = RepeatedTrigger(
+    cool_trigger = RepeatedTrigger(
         num=num_frames, width=exposure, deadtime=deadtime, post_delay=0, repeats=1
+    )
+    heat_trigger = RepeatedTrigger(
+        num=num_frames,
+        width=exposure,
+        deadtime=deadtime,
+        post_delay=(heat_temp - cool_temp) / heat_rate / heat_collections,
+        repeats=heat_collections,
     )
     _md = {
         "dets": [det.name for det in dets],
@@ -154,47 +162,26 @@ def linkam_plan(
 
     @bpp.stage_decorator([flyer])
     @bpp.run_decorator(md=_md)
-    def inner_linkam_fly_plan():
+    def inner_linkam_plan():
+        # TODO: should the start temp be supplied to the plan?
+        # Step down at the cool rate
         current = yield from bps.rd(linkam, default_value=cool_temp + cool_rate * 10)
         yield from bps.mv(linkam.ramp_rate, cool_rate)
         cool_temps = np.linspace(current, cool_temp, cool_collections)
         for temp in cool_temps:
-            yield from bps.mv(linkam, temp, flyer, repeated_trigger)
-            yield from fly_and_collec
-
-        yield from bps.abs_set(linkam.ramp_rate, ramp_rate)
+            yield from bps.mv(linkam, temp, flyer, cool_trigger)
+            # Collect at each step
+            yield from fly_and_collect(flyer)
+        # Ramp up at heat rate
+        yield from bps.mv(linkam.ramp_rate, heat_rate, flyer, heat_trigger)
         linkam_group = group_uuid("linkam")
-        yield from bps.abs_set(linkam, target_temp, group=linkam_group, wait=False)
-        done = False
-        while not done:
-            yield from take_timed_frames(exposure, num_frames)
-            try:
-                yield from bps.wait(group=linkam_group, timeout=period)
-            except TimeoutError:
-                pass
-            else:
-                done = True
+        yield from bps.abs_set(linkam, heat_temp, group=linkam_group, wait=False)
+        # Collect constantly
+        yield from fly_and_collect(flyer)
+        # Make sure linkam has finished
+        yield from bps.wait(group=linkam_group)
 
-
-def fast_freeze_plan(
-    start_temp: float,
-    freeze_temp: float,
-):
-    pass
-
-
-def generic_thing():
-    rs_uid = yield from scanspec_fly(
-        flyer=ScanspecFlyer(
-            dets=[saxs, waxs],
-            settings={panda: settings_from_yaml("/path/to/panda_settings.yaml")},
-            panda_streams=[PandAHDFLogic(panda, {"COUNTER1.VAL": "I0"})],
-            fly_logic=PandATimeSeqLogic(panda),
-        ),
-        sw_spec=Line(linkam, start_temp, stop_temp, num_temps),
-        sw_dets=[linkam],
-        hw_spec=Static.duration(exposure, num_frames),
-    )
+    rs_uid = yield from inner_linkam_plan()
     return rs_uid
 
 
