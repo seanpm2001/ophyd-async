@@ -34,6 +34,8 @@ from ophyd_async.core.utils import merge_gathered_dicts
 class DetectorTrigger(Enum):
     #: Detector generates internal trigger for given rate
     internal = ()
+    #: Expect a series of arbitrary length trigger signals
+    edge_trigger = ()
     #: Expect a series of constant width external gate signals
     constant_gate = ()
     #: Expect a series of variable width external gate signals
@@ -50,6 +52,7 @@ class DetectorLogic(ABC):
         self,
         trigger: DetectorTrigger = DetectorTrigger.internal,
         num: int = 0,
+        exposure: Optional[float] = None,
     ) -> AsyncStatus:
         """Arm the detector and return AsyncStatus that waits for num frames to be written"""
 

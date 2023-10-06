@@ -145,6 +145,7 @@ def linkam_plan(
         # Or maybe a different object?
     )
     deadtime = max(det.detector_logic.get_deadtime(exposure) for det in dets)
+    # TODO: set the exposure time of all the dets here
     cool_trigger = RepeatedTrigger(
         num=num_frames, width=exposure, deadtime=deadtime, post_delay=0, repeats=1
     )
@@ -207,6 +208,18 @@ def fly_and_collect(flyer, flush_period=0.5, checkpoint_every_collect=False):
             yield from bps.checkpoint()
 
 
+@dataclass(frozen=True)
+class TriggerInfo:
+    #: Number of triggers that will be sent
+    num: int
+    #: Sort of triggers that will be sent
+    trigger: DetectorTrigger
+    #: What is the minimum deadtime between triggers
+    deadtime: float
+    #: What is the maximum high time of the triggers
+    livetime: float
+
+
 class DetectorGroupLogic(ABC):
     # Read multipliers here, exposure is set in the plan
     @abstractmethod
@@ -214,7 +227,7 @@ class DetectorGroupLogic(ABC):
         """Open all writers, wait for them to be open and return their descriptors"""
 
     @abstractmethod
-    async def ensure_armed(self) -> AsyncStatus:
+    async def ensure_armed(self, trigger_info: TriggerInfo) -> AsyncStatus:
         """Ensure the detectors are armed, return AsyncStatus that waits for disarm."""
 
     @abstractmethod
@@ -234,7 +247,7 @@ class DetectorGroupLogic(ABC):
         """Close all writers and wait for them to be closed"""
 
 
-class TriggeredDetectorsLogic(DetectorGroupLogic):
+class SameTriggerDetectorGroupLogic(DetectorGroupLogic):
     def __init__(
         self,
         detector_logics: Sequence[DetectorLogic],
@@ -243,18 +256,31 @@ class TriggeredDetectorsLogic(DetectorGroupLogic):
         self.detector_logics = detector_logics
         self.writer_logics = writer_logics
         self._arm_status: Optional[AsyncStatus] = None
+        self._trigger_info: Optional[TriggerInfo] = None
 
     async def open(self) -> Dict[str, Descriptor]:
         return merge_gathered_dicts(wl.open() for wl in self.writer_logics)
 
-    async def ensure_armed(self) -> AsyncStatus:
-        if not self._arm_status or self._arm_status.done:
+    async def ensure_armed(self, trigger_info: TriggerInfo) -> AsyncStatus:
+        if (
+            not self._arm_status
+            or self._arm_status.done
+            or trigger_info != self._trigger_info
+        ):
             # We need to re-arm
-            # TODO: how to do variable gate here?
+            await gather_list(dl.disarm() for dl in self.detector_logics)
+            for dl in self.detector_logics:
+                required = dl.get_deadtime(trigger_info.livetime)
+                assert required > trigger_info.deadtime, (
+                    f"Detector {dl} needs at least {required}s deadtime, "
+                    "but trigger logic provides only {trigger_info.deadtime}s"
+                )
             statuses = await gather_list(
-                dl.arm(DetectorTrigger.constant_gate) for dl in self.detector_logics
+                dl.arm(trigger=trigger_info.trigger, exposure=trigger_info.livetime)
+                for dl in self.detector_logics
             )
             self._arm_status = AsyncStatus(gather_list(statuses))
+            self._trigger_info = trigger_info
         return self._arm_status
 
     async def collect_asset_docs(self) -> AsyncIterator[Asset]:
@@ -280,8 +306,12 @@ class TriggeredDetectorsLogic(DetectorGroupLogic):
 
 class TriggerLogic(ABC, Generic[T]):
     @abstractmethod
-    async def prepare(self, value: T) -> int:
-        """Move to the start of the flyscan, providing the number of expected frames"""
+    def trigger_info(self, value: T) -> TriggerInfo:
+        """Return info about triggers that will be produced for a given value"""
+
+    @abstractmethod
+    async def prepare(self, value: T):
+        """Move to the start of the flyscan"""
 
     @abstractmethod
     async def start(self):
@@ -306,11 +336,21 @@ class RepeatedTrigger:
 
 
 class PandARepeatedTriggerLogic(TriggerLogic[RepeatedTrigger]):
+    trigger = DetectorTrigger.constant_gate
+
     def __init__(self, seq: SeqBlock, shutter_time: float = 0) -> None:
         self.seq = seq
         self.shutter_time = shutter_time
 
-    async def prepare(self, value: RepeatedTrigger) -> int:
+    def trigger_info(self, value: RepeatedTrigger) -> TriggerInfo:
+        return TriggerInfo(
+            num=value.num * value.repeats,
+            trigger=DetectorTrigger.constant_gate,
+            deadtime=value.deadtime,
+            livetime=value.width,
+        )
+
+    async def prepare(self, value: RepeatedTrigger):
         table = seq_table_from_rows(
             # Open and wait for shutter_time so it is open
             SeqTableRow(time2=in_micros(self.shutter_time), outa2=True),
@@ -335,7 +375,6 @@ class PandARepeatedTriggerLogic(TriggerLogic[RepeatedTrigger]):
             self.seq.repeats.set(value.repeats),
             self.seq.table.set(table),
         )
-        return value.num * value.repeats
 
     async def start(self):
         await self.seq.enable.set("ONE")
@@ -395,9 +434,10 @@ class StandardFlyable(
         await self._prepare(value)
 
     async def _prepare(self, value: T):
+        trigger_info = self._trigger_logic.trigger_info(value)
         # Move to start and setup the flyscan, and arm dets in parallel
         self._det_status, num_frames = await asyncio.gather(
-            self._detector_group_logic.ensure_armed(),
+            self._detector_group_logic.ensure_armed(trigger_info),
             self._trigger_logic.prepare(value),
         )
         self._last_frame = self._current_frame + num_frames
