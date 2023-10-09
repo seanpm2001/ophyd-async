@@ -134,9 +134,9 @@ def linkam_plan(
 
     Fast shutter will be opened for each group of exposures
     """
-    dets = [saxs, waxs, tetramm]
-    flyer = StandardFlyable(
-        TriggeredDetectorsLogic(
+    dets = [saxs, waxs]  # and tetramm
+    flyer = HardwareTriggeredFlyable(
+        SameTriggerDetectorGroupLogic(
             [det.detector_logic for det in dets],
             [det.writer_logic for det in dets],
         ),
@@ -386,7 +386,7 @@ class PandARepeatedTriggerLogic(TriggerLogic[RepeatedTrigger]):
         await wait_for_value(self.seq.active, 0, timeout=1)
 
 
-class StandardFlyable(
+class HardwareTriggeredFlyable(
     Device, Movable, Stageable, Flyable, Collectable, WritesExternalAssets, Generic[T]
 ):
     def __init__(
@@ -501,7 +501,7 @@ class StandardFlyable(
 ScanAxis = Union[Device, Literal["DURATION"]]
 
 
-class ScanSpecFlyable(StandardFlyable[Path[ScanAxis]], Pausable):
+class ScanSpecFlyable(HardwareTriggeredFlyable[Path[ScanAxis]], Pausable):
     _spec: Optional[Spec] = None
     _frames: Sequence[Frames] = ()
 
