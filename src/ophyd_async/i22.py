@@ -14,6 +14,7 @@ from typing import (
     Literal,
     Optional,
     Sequence,
+    Tuple,
     Union,
 )
 
@@ -109,81 +110,6 @@ with DeviceCollector():
     waxs = hdf_stats_pilatus("BL22I-EA-DET-01:", "/path/to/waxs_settings.yaml")
     panda = PandA("BL22I-MO-PANDA-01:")
     linkam = Linkam("BL22I-EA-TEMPC-01:")
-
-
-def linkam_plan(
-    cool_temp: float,
-    cool_rate: float,
-    cool_collections: int,
-    heat_temp: float,
-    heat_rate: float,
-    heat_collections: int,
-    num_frames: int,
-    exposure: float,
-    md: Optional[Dict[str, Any]] = None,
-):
-    """Cool in steps, then heat constantly, taking collections of num_frames each time::
-
-                                __ heat_temp
-                   \           /
-                    \__       /
-                       \     /
-            cool_temp   \__ /
-        exposures    xx  xx   xx    num_frames=2 each time
-        cool_collections=2  heat_collections=1
-
-    Fast shutter will be opened for each group of exposures
-    """
-    dets = [saxs, waxs]  # and tetramm
-    flyer = HardwareTriggeredFlyable(
-        SameTriggerDetectorGroupLogic(
-            [det.detector_logic for det in dets],
-            [det.writer_logic for det in dets],
-        ),
-        PandARepeatedTriggerLogic(panda.seq[1], shutter_time=0.004),
-        settings={saxs: config_with_temperature_stamping},
-        # Or maybe a different object?
-    )
-    deadtime = max(det.detector_logic.get_deadtime(exposure) for det in dets)
-    # TODO: set the exposure time of all the dets here
-    cool_trigger = RepeatedTrigger(
-        num=num_frames, width=exposure, deadtime=deadtime, post_delay=0, repeats=1
-    )
-    heat_trigger = RepeatedTrigger(
-        num=num_frames,
-        width=exposure,
-        deadtime=deadtime,
-        post_delay=(heat_temp - cool_temp) / heat_rate / heat_collections,
-        repeats=heat_collections,
-    )
-    _md = {
-        "dets": [det.name for det in dets],
-    }
-    _md.update(md or {})
-
-    @bpp.stage_decorator([flyer])
-    @bpp.run_decorator(md=_md)
-    def inner_linkam_plan():
-        # TODO: should the start temp be supplied to the plan?
-        # Step down at the cool rate
-        current = yield from bps.rd(linkam, default_value=cool_temp + cool_rate * 10)
-        yield from bps.mv(linkam.ramp_rate, cool_rate)
-        cool_temps = np.linspace(current, cool_temp, cool_collections)
-        for temp in cool_temps:
-            yield from bps.mv(linkam, temp, flyer, cool_trigger)
-            # Collect at each step
-            yield from fly_and_collect(flyer)
-        # Ramp up at heat rate
-        yield from bps.mv(linkam.ramp_rate, heat_rate, flyer, heat_trigger)
-        linkam_group = group_uuid("linkam")
-        yield from bps.abs_set(linkam, heat_temp, group=linkam_group, wait=False)
-        # Collect constantly
-        yield from fly_and_collect(flyer)
-        # Make sure linkam has finished
-        yield from bps.wait(group=linkam_group)
-
-    rs_uid = yield from inner_linkam_plan()
-    return rs_uid
 
 
 def group_uuid(name: str) -> str:
@@ -331,8 +257,8 @@ class RepeatedTrigger:
     num: int
     width: float
     deadtime: float
-    post_delay: float
-    repeats: float
+    repeats: int = 1
+    period: float = 0.0
 
 
 class PandARepeatedTriggerLogic(TriggerLogic[RepeatedTrigger]):
@@ -351,9 +277,15 @@ class PandARepeatedTriggerLogic(TriggerLogic[RepeatedTrigger]):
         )
 
     async def prepare(self, value: RepeatedTrigger):
+        trigger_time = value.num * (value.width + value.deadtime)
+        pre_delay = max(value.period - 2 * self.shutter_time - trigger_time, 0)
         table = seq_table_from_rows(
-            # Open and wait for shutter_time so it is open
-            SeqTableRow(time2=in_micros(self.shutter_time), outa2=True),
+            # Wait for pre-delay then open shutter
+            SeqTableRow(
+                time1=in_micros(pre_delay),
+                time2=in_micros(self.shutter_time),
+                outa2=True,
+            ),
             # Keeping shutter open, do N triggers
             SeqTableRow(
                 repeats=value.num,
@@ -363,8 +295,8 @@ class PandARepeatedTriggerLogic(TriggerLogic[RepeatedTrigger]):
                 time2=in_micros(value.deadtime),
                 outa2=True,
             ),
-            # Add the shutter close and post delay
-            SeqTableRow(time2=in_micros(self.shutter_time + value.post_delay)),
+            # Add the shutter close
+            SeqTableRow(time2=in_micros(self.shutter_time)),
         )
         await asyncio.gather(
             self.seq.prescale_units.set("us"),
@@ -577,4 +509,125 @@ def scanspec_fly(
             )
 
     rs_uid = yield from hw_scanspec_fly()
+    return rs_uid
+
+
+def step_to_num(start: float, stop: float, step: float) -> Tuple[float, float, int]:
+    # Make step be the right direction
+    step = abs(step) if stop > start else -abs(step)
+    # If stop is within 1% of a step then include it
+    num = int((stop - start) / step + 0.01)
+    return start, start + num * step, num
+
+
+def scan_linkam(
+    flyer: HardwareTriggeredFlyable,
+    start: float,
+    stop: float,
+    step: float,
+    rate: float,
+    exposure: float,
+    deadtime: float,
+    num_frames: int,
+    fly=False,
+):
+    one_batch = RepeatedTrigger(num=num_frames, width=exposure, deadtime=deadtime)
+    start, stop, num = step_to_num(start, stop, step)
+    yield from bps.mv(linkam.ramp_rate, rate)
+    if fly:
+        # Do a single batch to start
+        yield from bps.mv(linkam, start, flyer, one_batch)
+        yield from fly_and_collect(flyer)
+        # Setup for many batches
+        many_batches = RepeatedTrigger(
+            num=num_frames,
+            width=exposure,
+            deadtime=deadtime,
+            repeats=num,
+            period=abs((stop - start) / rate) / num,
+        )
+        yield from bps.mv(flyer, many_batches)
+        # Then start flying, collecting roughly every step
+        linkam_group = group_uuid("linkam")
+        yield from bps.abs_set(linkam, stop, group=linkam_group, wait=False)
+        # Collect constantly
+        yield from fly_and_collect(flyer)
+        # Make sure linkam has finished
+        yield from bps.wait(group=linkam_group)
+    else:
+        temps = np.linspace(start, stop, num)
+        for temp in temps:
+            yield from bps.mv(linkam, temp, flyer, one_batch)
+            # Collect at each step
+            yield from fly_and_collect(flyer)
+
+
+def linkam_plan(
+    start_temp: float,
+    cool_temp: float,
+    cool_step: float,
+    cool_rate: float,
+    heat_temp: float,
+    heat_step: float,
+    heat_rate: float,
+    num_frames: int,
+    exposure: float,
+    md: Optional[Dict[str, Any]] = None,
+):
+    """Cool in steps, then heat constantly, taking collections of num_frames each time::
+
+                      _             __ heat_temp
+                     / \           /
+        cool_interval___\__       /
+                           \     /
+                  cool_temp \__ /
+        exposures        xx  xx   xx    num_frames=2 each time
+
+    Fast shutter will be opened for each group of exposures
+    """
+    dets = [saxs, waxs]  # and tetramm
+    flyer = HardwareTriggeredFlyable(
+        SameTriggerDetectorGroupLogic(
+            [det.detector_logic for det in dets],
+            [det.writer_logic for det in dets],
+        ),
+        PandARepeatedTriggerLogic(panda.seq[1], shutter_time=0.004),
+        settings={saxs: config_with_temperature_stamping},
+        # Or maybe a different object?
+    )
+    deadtime = max(det.detector_logic.get_deadtime(exposure) for det in dets)
+    _md = {
+        "dets": [det.name for det in dets],
+    }
+    _md.update(md or {})
+
+    @bpp.stage_decorator([flyer])
+    @bpp.run_decorator(md=_md)
+    def inner_linkam_plan():
+        # Step down at the cool rate
+        yield from scan_linkam(
+            flyer=flyer,
+            start=start_temp,
+            stop=cool_temp,
+            step=cool_step,
+            rate=cool_rate,
+            exposure=exposure,
+            deadtime=deadtime,
+            num_frames=num_frames,
+            fly=False,
+        )
+        # Fly up at the heat rate
+        yield from scan_linkam(
+            flyer=flyer,
+            start=cool_temp,
+            stop=heat_temp,
+            step=heat_step,
+            rate=heat_rate,
+            exposure=exposure,
+            deadtime=deadtime,
+            num_frames=num_frames,
+            fly=True,
+        )
+
+    rs_uid = yield from inner_linkam_plan()
     return rs_uid
