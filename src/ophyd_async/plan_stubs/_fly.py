@@ -1,6 +1,7 @@
 from typing import List, Optional
 
 import bluesky.plan_stubs as bps
+from bluesky.utils import short_uid
 
 from ophyd_async.core import (
     DetectorTrigger,
@@ -101,6 +102,10 @@ def prepare_static_seq_table_flyer_and_detectors_with_same_trigger(
     yield from bps.wait(group="prep")
 
 
+# Collect every 0.5 seconds even if the flyscan is still completing
+_SECONDS_TO_FORCE_COLLECT_AFTER = 0.5
+
+
 def fly_and_collect(
     stream_name: str,
     flyer: StandardFlyer[SeqTableInfo] | StandardFlyer[PcompInfo],
@@ -117,10 +122,18 @@ def fly_and_collect(
     yield from bps.kickoff(flyer, wait=True)
     for detector in detectors:
         yield from bps.kickoff(detector)
+    group = short_uid(label="complete")
 
-    yield from bps.collect_while_completing(
-        flyers=[flyer], dets=detectors, flush_period=0.5, stream_name=stream_name
-    )
+    yield from bps.complete(flyer, wait=False, group=group)
+    for detector in detectors:
+        yield from bps.complete(detector, wait=False, group=group)
+
+    done = False
+    while not done:
+        done = yield from bps.wait(
+            group=group, timeout=_SECONDS_TO_FORCE_COLLECT_AFTER, move_on=True
+        )
+        yield from bps.collect(*detectors, name=stream_name)
 
 
 def fly_and_collect_with_static_pcomp(

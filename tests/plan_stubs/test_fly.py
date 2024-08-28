@@ -114,8 +114,9 @@ class MockDetector(StandardDetector):
         super().__init__(controller, writer, config_sigs, name)
 
     @WatchableAsyncStatus.wrap
-    async def kickoff(self):
-        super().kickoff()
+    async def complete(self):
+        assert self._arm_status, "Prepare not run"
+        assert self._trigger_info
         self.writer.increment_index()
         async for index in self.writer.observe_indices_written(
             self._trigger_info.frame_timeout
