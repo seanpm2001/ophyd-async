@@ -79,6 +79,8 @@ def seq_table_from_rows(*rows: SeqTableRow):
     """
     Constructs a sequence table from a series of rows.
     """
+    if type(rows[0]) is tuple:
+        rows = rows[0]
     return seq_table_from_arrays(
         repeats=np.array([row.repeats for row in rows], dtype=np.uint16),
         trigger=[row.trigger for row in rows],
