@@ -137,4 +137,4 @@ def config_ophyd_async_logging(
         handler.close()
 
 
-set_handler = config_ophyd_async_logging  # for back-compat
+set_handler = config_ophyd_async_logging  # for back-compact

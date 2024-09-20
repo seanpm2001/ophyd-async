@@ -59,7 +59,7 @@ def _data_key_from_augmented_value(
     value fields by DBR type.
 
     Args:
-        value (AugmentedValue): Description of the the return type of a DB record
+        value (AugmentedValue): Description of the return type of DB record
         choices: Optional list of enum choices to pass as metadata in the datakey
         dtype: Optional override dtype when AugmentedValue is ambiguous, e.g. booleans
 

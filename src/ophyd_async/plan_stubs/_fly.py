@@ -188,7 +188,7 @@ def time_resolved_fly_and_collect_with_static_seq_table(
        - Declare the stream and kickoff the scan
        - Collect while completing
 
-    This needs to be used in a plan that instantates detectors and a flyer,
+    This needs to be used in a plan that instantiates detectors and a flyer,
     stages/unstages the devices, and opens and closes the run.
 
     """

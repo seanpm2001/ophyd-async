@@ -279,7 +279,7 @@ async def test_hardware_triggered_flyable_with_static_seq_table_logic(
         for detector in detector_list:
             yield from bps.complete(detector, wait=False, group="complete")
 
-        # Manually incremenet the index as if a frame was taken
+        # Manually increment the index as if a frame was taken
         for detector in detector_list:
             detector.writer.increment_index()
 

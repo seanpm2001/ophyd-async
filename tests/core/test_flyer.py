@@ -188,7 +188,7 @@ async def test_hardware_triggered_flyable(
             yield from bps.complete(detector, wait=False, group="complete")
         assert flyer._trigger_logic.state == TriggerState.null
 
-        # Manually incremenet the index as if a frame was taken
+        # Manually increment the index as if a frame was taken
         for detector in detectors:
             detector.writer.index += 1
 

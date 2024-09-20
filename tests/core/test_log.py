@@ -36,7 +36,7 @@ def test_config_ophyd_async_logging_with_file_handler(tmp_path):
 
 
 def test_config_ophyd_async_logging_removes_extra_handlers():
-    # Protect global variable in other pytests
+    # Protect global variable in other pytest's
     class FakeLogger:
         def __init__(self):
             self.handlers = []

@@ -80,7 +80,7 @@ async def test_can_read(test_adaravis: adaravis.AravisDetector):
     assert (await test_adaravis.read()) == {}
 
 
-async def test_decribe_describes_writer_dataset(
+async def test_describe_describes_writer_dataset(
     test_adaravis: adaravis.AravisDetector, one_shot_trigger_info: TriggerInfo
 ):
     set_mock_value(test_adaravis._writer.hdf.file_path_exists, True)

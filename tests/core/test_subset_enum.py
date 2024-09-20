@@ -87,6 +87,6 @@ async def test_runtime_enum_signal():
     assert await signal_rw_ca.get_value() == "B2"
 
     # Will accept string values even if they're not in the runtime enum
-    # Though type checking should compain
+    # Though type checking should complain
     await signal_rw_pva.set("C1")  # type: ignore
     await signal_rw_ca.set("C2")  # type: ignore

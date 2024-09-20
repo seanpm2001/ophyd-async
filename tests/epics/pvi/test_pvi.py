@@ -186,7 +186,7 @@ async def test_device_create_children_from_annotations_with_device_vectors(
     block_1_device = device.device
     block_2_device_vector = device.device_vector
 
-    # create_children_from_annotiations should have made DeviceVectors
+    # create_children_from_annotations should have made DeviceVectors
     # and an optional Block, but no signals
     assert hasattr(device, "device_vector")
     assert not hasattr(device, "signal_rw")

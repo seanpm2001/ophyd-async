@@ -8,7 +8,7 @@ from ophyd_async.plan_stubs import ensure_connected
 from ophyd_async.sim.demo import PatternDetector
 
 
-# NOTE the async operations with h5py are non-trival
+# NOTE the async operations with h5py are non-trivial
 # because of lack of native support for async operations
 # see https://github.com/h5py/h5py/issues/837
 async def test_streaming_plan(RE: RunEngine, sim_pattern_detector: PatternDetector):

@@ -115,7 +115,7 @@ async def test_hdf_panda_hardware_triggered_flyable(
         yield from bps.complete(flyer, wait=False, group="complete")
         yield from bps.complete(mock_hdf_panda, wait=False, group="complete")
 
-        # Manually incremenet the index as if a frame was taken
+        # Manually increment the index as if a frame was taken
         set_mock_value(mock_hdf_panda.data.num_captured, 1)
         set_mock_value(flyer.trigger_logic.seq.active, 0)
 
@@ -232,7 +232,7 @@ async def test_hdf_panda_hardware_triggered_flyable_with_iterations(
             yield from bps.complete(flyer, wait=False, group="complete")
             yield from bps.complete(mock_hdf_panda, wait=False, group="complete")
 
-            # Manually incremenet the index as if a frame was taken
+            # Manually increment the index as if a frame was taken
             set_mock_value(mock_hdf_panda.data.num_captured, 1)
             set_mock_value(flyer.trigger_logic.seq.active, 0)
 

@@ -125,7 +125,7 @@ async def test_can_collect(
     assert stream_datum["indices"] == {"start": 0, "stop": 1}
 
 
-async def test_can_decribe_collect(
+async def test_can_describe_collect(
     test_advimba: advimba.VimbaDetector, one_shot_trigger_info: TriggerInfo
 ):
     set_mock_value(test_advimba._writer.hdf.file_path_exists, True)

@@ -256,7 +256,7 @@ async def test_wait_for_value_with_value():
     assert 0.2 < await t < 1.0
 
 
-async def test_wait_for_value_with_funcion():
+async def test_wait_for_value_with_function():
     signal = epics_signal_rw(float, read_pv="pva://signal", name="signal")
     await signal.connect(mock=True)
     set_mock_value(signal, 45.8)
@@ -318,7 +318,7 @@ async def test_assert_value(mock_signal: SignalRW):
     await assert_value(mock_signal, 168)
 
 
-async def test_assert_reaading(mock_signal: SignalRW):
+async def test_assert_reading(mock_signal: SignalRW):
     set_mock_value(mock_signal, 888)
     dummy_reading = {
         "mock_signal": Reading({"alarm_severity": 0, "timestamp": ANY, "value": 888})
@@ -326,7 +326,7 @@ async def test_assert_reaading(mock_signal: SignalRW):
     await assert_reading(mock_signal, dummy_reading)
 
 
-async def test_failed_assert_reaading(mock_signal: SignalRW):
+async def test_failed_assert_reading(mock_signal: SignalRW):
     set_mock_value(mock_signal, 888)
     dummy_reading = {
         "mock_signal": Reading({"alarm_severity": 0, "timestamp": ANY, "value": 88})

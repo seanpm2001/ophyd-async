@@ -29,7 +29,7 @@ from ophyd_async.epics.signal import epics_signal_r, epics_signal_rw
 async def test_mock_signal_backend(connect_mock_mode):
     mock_signal = SignalRW(MockSignalBackend(datatype=str))
     # If mock is false it will be handled like a normal signal, otherwise it will
-    # initalize a new backend from the one in the line above
+    # initialize a new backend from the one in the line above
     await mock_signal.connect(mock=connect_mock_mode)
     assert isinstance(mock_signal._backend, MockSignalBackend)
 
@@ -319,7 +319,7 @@ async def test_reset_mock_put_calls(mock_signals):
     with pytest.raises(AssertionError) as exc:
         get_mock_put(signal1).assert_called_with("test_value", wait=ANY, timeout=ANY)
     # Replacing spaces because they change between runners
-    # (e.g the github actions runner has more)
+    # (e.g. the GitHub actions runner has more)
     assert str(exc.value).replace(" ", "").replace("\n", "") == (
         "expectedcallnotfound."
         "Expected:put('test_value',wait=<ANY>,timeout=<ANY>)"

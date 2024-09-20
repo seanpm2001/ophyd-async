@@ -54,7 +54,7 @@ def reset_mock_put_calls(signal: Signal):
 
 class _SetValuesIterator:
     # Garbage collected by the time __del__ is called unless we put it as a
-    # global attrbute here.
+    # global attribute here.
     require_all_consumed: bool = False
 
     def __init__(
@@ -74,7 +74,7 @@ class _SetValuesIterator:
         return self
 
     def __next__(self):
-        # Will propogate StopIteration
+        # Will propagate StopIteration
         self.index, next_value = next(self.iterator)
         set_mock_value(self.signal, next_value)
         return next_value
@@ -85,7 +85,7 @@ class _SetValuesIterator:
             # require_all_consumed=True, we can therefore assume they
             # supplied a finite list.
             # In the case of require_all_consumed=False, an infinite
-            # iterble is permitted
+            # iterable is permitted
             values = list(self.values)
             if self.index != len(values):
                 # Report the values consumed and the values yet to be

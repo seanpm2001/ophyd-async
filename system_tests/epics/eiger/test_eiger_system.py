@@ -81,7 +81,7 @@ async def test_trigger_saves_file(test_eiger: EigerDetector, setup_device: Setup
     await test_eiger.stage()
     await test_eiger.prepare(single_shot)
     # Need to work out what the hold up is in prepare so we cant do this straight away.
-    # File path propogation?
+    # File path propagation?
     await asyncio.sleep(0.5)
     await setup_device.trigger.set(1)
     await asyncio.sleep(0.5)  # Need to work out when it's actually finished writing

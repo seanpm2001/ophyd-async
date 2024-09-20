@@ -51,7 +51,7 @@ class PilatusController(DetectorControl):
             self._drv
         )
         # The pilatus has an additional PV that goes True when the camserver
-        # is actually ready. Should wait for that too or we risk dropping
+        # is actually ready. Should wait for that too, or we risk dropping
         # a frame
         await wait_for_value(
             self._drv.armed,
