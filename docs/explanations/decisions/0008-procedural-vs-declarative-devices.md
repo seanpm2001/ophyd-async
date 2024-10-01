@@ -47,7 +47,7 @@ or the EPICS one could be declarative:
 ```python
 class EpicsDeclarativeDevice(StandardReadable, EpicsDevice):
     value: Annotated[
-        DeviceVector[SignalR[float]], HINTED, EpicsSuffix("Mode%d", "num_values")
+        DeviceVector[SignalR[float]], HINTED, EpicsSuffix("Value%d", "num_values")
     ]
     mode: Annotated[SignalRW[EnergyMode], CONFIG, EpicsSuffix("Mode")]
 ```
