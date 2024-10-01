@@ -56,8 +56,11 @@ Which do we prefer?
 
 ## Decision
 
-What decision we made.
+We decided that the declarative approach is to be preferred until we need to write formatted strings. At that point we should drop to an `__init__` method and a for loop. 
 
 ## Consequences
 
-What we will do as a result of this decision.
+- Add support for reading annotations and `EpicsSuffix` in an `EpicsDevice` baseclass
+- Do the `HINTS` and `CONFIG` flags in annotations for `StandardReadable` in a later iteration
+- Ensure we can always drop to `__init__`
+- Decisions on mixin classes vs decorators is deferred until later
